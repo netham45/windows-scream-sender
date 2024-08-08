@@ -36,6 +36,7 @@ HRESULT CaptureAudio(IAudioClient* pAudioClient, IAudioCaptureClient* pCaptureCl
     char pcmBuffer[BUFFER_SIZE * 8] = { 0 };
     uint32_t pcmBufferHead = 0;
     while (true) {
+        Sleep(3);
         HRESULT hr = pCaptureClient->GetNextPacketSize(&packetLength);
         if (FAILED(hr)) {
             LogError("Failed to get next packet size", hr);
@@ -83,6 +84,11 @@ HRESULT CaptureAudio(IAudioClient* pAudioClient, IAudioCaptureClient* pCaptureCl
             hr = pCaptureClient->ReleaseBuffer(numFramesAvailable);
             if (FAILED(hr)) {
                 LogError("Failed to release buffer", hr);
+                return hr;
+            }
+            hr = pCaptureClient->GetNextPacketSize(&packetLength);
+            if (FAILED(hr)) {
+                LogError("Failed to get next packet size", hr);
                 return hr;
             }
         }
