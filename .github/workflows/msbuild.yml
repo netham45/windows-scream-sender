@@ -47,4 +47,4 @@ jobs:
       uses: actions/upload-artifact@v2
       with:
         name: ScreamSender
-        path: ${{env.GITHUB_WORKSPACE}}/bin/${{env.BUILD_CONFIGURATION}}/ScreamSender.exe
+        path: D:\a\windows-scream-sender\windows-scream-sender\x64\Release\ScreamSender.exe
