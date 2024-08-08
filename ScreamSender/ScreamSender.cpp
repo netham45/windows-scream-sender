@@ -279,12 +279,6 @@ int main(int argc, char* argv[]) {
     }
 
     // This part will never be reached in the current implementation
-    if (multicast) {
-        ip_mreq mreq;
-        mreq.imr_multiaddr.s_addr = inet_addr(REMOTE_IP);
-        mreq.imr_interface.s_addr = INADDR_ANY;
-        setsockopt(sock, IPPROTO_IP, IP_DROP_MEMBERSHIP, (char*)&mreq, sizeof(mreq));
-    }
     closesocket(sock);
     WSACleanup();
     CoUninitialize();
