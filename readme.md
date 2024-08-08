@@ -1,5 +1,5 @@
 # ScreamSender
-This is a usermode alternative to the Windows Scream driver that sends audio over the network. It implements the UDP protocol from the Scream Windows Audio driver. It is intended to be used with ScreamRouter.
+This is a usermode alternative to the Windows Scream driver that sends audio over the network. It implements the UDP protocol from the Scream Windows Audio driver. It is intended to be used with ScreamRouter. It works by capturing audio to an existing sound card instead of providing it's own.
 
 ## Usage
 
