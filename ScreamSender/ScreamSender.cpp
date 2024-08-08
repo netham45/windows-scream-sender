@@ -24,7 +24,7 @@ void LogError(const std::string& message, HRESULT hr) {
     printf("%i : %s\n", hr, message.c_str());
 }
 
-HRESULT CaptureAudio(IAudioClient* pAudioClient, IAudioCaptureClient* pCaptureClient, WAVEFORMATEX* pwfx, SOCKET sock, sockaddr_in remoteAddr) {
+HRESULT CaptureAudio(IAudioClient* pAudioClient, IAudioCaptureClient* pCaptureClient, WAVEFORMATEXTENSIBLE* pwfex, SOCKET sock, sockaddr_in remoteAddr) {
     UINT32 packetLength = 0;
     BYTE* pData;
     UINT32 numFramesAvailable;
@@ -56,19 +56,19 @@ HRESULT CaptureAudio(IAudioClient* pAudioClient, IAudioCaptureClient* pCaptureCl
                 Log("Silent buffer detected");
             }
             if (pData) {
-                UINT32 bytesToCopy = numFramesAvailable * pwfx->nBlockAlign;
+                UINT32 bytesToCopy = numFramesAvailable * pwfex->Format.nBlockAlign;
 
                 memcpy(pcmBuffer + pcmBufferHead, pData, bytesToCopy);
                 pcmBufferHead += bytesToCopy;
                 while (pcmBufferHead >= BUFFER_SIZE) {
-                    bool is_44100 = pwfx->nSamplesPerSec % 44100 == 0;
-                    int sample_mask = pwfx->nSamplesPerSec / (is_44100 ? 44100 : 48000);
+                    bool is_44100 = pwfex->Format.nSamplesPerSec % 44100 == 0;
+                    int sample_mask = pwfex->Format.nSamplesPerSec / (is_44100 ? 44100 : 48000);
                     sample_mask |= is_44100 << 7;
                     buffer[0] = sample_mask;
-                    buffer[1] = pwfx->wBitsPerSample;
-                    buffer[2] = pwfx->nChannels;
-                    buffer[3] = static_cast<BYTE>((pwfx->wFormatTag >> 8) & 0xFF);
-                    buffer[4] = static_cast<BYTE>(pwfx->wFormatTag & 0xFF);
+                    buffer[1] = pwfex->Format.wBitsPerSample;
+                    buffer[2] = pwfex->Format.nChannels;
+                    buffer[3] = static_cast<BYTE>((pwfex->dwChannelMask >> 8) & 0xFF);
+                    buffer[4] = static_cast<BYTE>(pwfex->dwChannelMask & 0xFF);
 
                     memcpy(buffer + HEADER_SIZE, pcmBuffer, BUFFER_SIZE);
                     int sendResult = sendto(sock, buffer, BUFFER_SIZE + HEADER_SIZE, 0, (sockaddr*)&remoteAddr, sizeof(remoteAddr));
@@ -224,7 +224,7 @@ int main(int argc, char* argv[]) {
         }
 
         Log("Starting audio capture");
-        hr = CaptureAudio(pAudioClient, pCaptureClient, pwfx, sock, remoteAddr);
+        hr = CaptureAudio(pAudioClient, pCaptureClient, reinterpret_cast<WAVEFORMATEXTENSIBLE*>(pwfx), sock, remoteAddr);
         if (FAILED(hr)) {
             LogError("Audio capture failed", hr);
         }
