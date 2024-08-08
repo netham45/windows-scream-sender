@@ -4,4 +4,10 @@ This is a usermode alternative to the Windows Scream driver that sends audio ove
 ## Usage
 
 * Build with Visual Studio
-* Run with `ScreamSender.exe <IP> [Port=16401]`
+* Run with `ScreamSender.exe <IP> [Port=16401] [-m]`
+  * -m for multicast
+
+
+To be compatible with a default Scream receiver:
+
+* `ScreamSender.exe 239.255.77.77 4010 -m`

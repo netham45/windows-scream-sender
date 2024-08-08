@@ -9,6 +9,7 @@
 #include <iomanip>
 #include <chrono>
 #include <string>
+#include <ws2ipdef.h>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "ole32.lib")
@@ -101,12 +102,26 @@ int main(int argc, char* argv[]) {
     Log("Application started");
 
     if (argc < 2) {
-        Log("Usage: program.exe <IP> [port]");
+        Log("Usage: program.exe <IP> [port] [-m]");
+        Log(" Default port 16401");
+        Log(" -m Enable Multicast");
         return 1;
     }
 
     const char* REMOTE_IP = argv[1];
-    int REMOTE_PORT = (argc > 2) ? std::stoi(argv[2]) : 16401;
+    int REMOTE_PORT = 16401;
+    bool multicast = false;
+
+    if (argc > 2)
+        if (strcmp(argv[2], "-m") == 0)
+            multicast = true;
+        else
+            REMOTE_PORT = std::stoi(argv[2]);
+
+
+    if (argc > 3)
+        if (strcmp(argv[3], "-m") == 0)
+            multicast = true;
 
     // Set the highest process priority possible
     if (!SetPriorityClass(GetCurrentProcess(), REALTIME_PRIORITY_CLASS)) {
@@ -151,6 +166,29 @@ int main(int argc, char* argv[]) {
     remoteAddr.sin_family = AF_INET;
     remoteAddr.sin_port = htons(REMOTE_PORT);
     remoteAddr.sin_addr.s_addr = inet_addr(REMOTE_IP);
+
+    if (multicast) {
+        int ttl = 32;  // Adjust TTL as needed
+        if (setsockopt(sock, IPPROTO_IP, IP_MULTICAST_TTL, (char*)&ttl, sizeof(ttl)) < 0) {
+            Log("Failed to set multicast TTL");
+            closesocket(sock);
+            WSACleanup();
+            CoUninitialize();
+            return 1;
+        }
+
+        // Join the multicast group
+        ip_mreq mreq;
+        mreq.imr_multiaddr.s_addr = inet_addr(REMOTE_IP);
+        mreq.imr_interface.s_addr = INADDR_ANY;
+        if (setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, (char*)&mreq, sizeof(mreq)) < 0) {
+            Log("Failed to join multicast group");
+            closesocket(sock);
+            WSACleanup();
+            CoUninitialize();
+            return 1;
+        }
+    }
 
     while (true) {
         IMMDeviceEnumerator* pEnumerator = NULL;
@@ -241,6 +279,12 @@ int main(int argc, char* argv[]) {
     }
 
     // This part will never be reached in the current implementation
+    if (multicast) {
+        ip_mreq mreq;
+        mreq.imr_multiaddr.s_addr = inet_addr(REMOTE_IP);
+        mreq.imr_interface.s_addr = INADDR_ANY;
+        setsockopt(sock, IPPROTO_IP, IP_DROP_MEMBERSHIP, (char*)&mreq, sizeof(mreq));
+    }
     closesocket(sock);
     WSACleanup();
     CoUninitialize();
