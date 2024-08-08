@@ -102,6 +102,24 @@ int main(int argc, char* argv[]) {
     const char* REMOTE_IP = argv[1];
     int REMOTE_PORT = (argc > 2) ? std::stoi(argv[2]) : 16401;
 
+    // Set the highest process priority possible
+    if (!SetPriorityClass(GetCurrentProcess(), REALTIME_PRIORITY_CLASS)) {
+        DWORD error = GetLastError();
+        LogError("Failed to set process priority", error);
+    }
+    else {
+        Log("Process priority set to REALTIME_PRIORITY_CLASS");
+    }
+
+    // Optionally, set the thread priority as well
+    if (!SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL)) {
+        DWORD error = GetLastError();
+        LogError("Failed to set thread priority", error);
+    }
+    else {
+        Log("Thread priority set to THREAD_PRIORITY_TIME_CRITICAL");
+    }
+
     HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
     if (FAILED(hr)) {
         LogError("Failed to initialize COM", hr);
