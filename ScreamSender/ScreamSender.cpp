@@ -168,6 +168,7 @@ int main(int argc, char* argv[]) {
     remoteAddr.sin_addr.s_addr = inet_addr(REMOTE_IP);
 
     if (multicast) {
+        // Set up multicast socket options
         int ttl = 32;  // Adjust TTL as needed
         if (setsockopt(sock, IPPROTO_IP, IP_MULTICAST_TTL, (char*)&ttl, sizeof(ttl)) < 0) {
             Log("Failed to set multicast TTL");
@@ -177,7 +178,18 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        // Join the multicast group
+        // Set IP_MULTICAST_IF to INADDR_ANY to send on all interfaces
+        in_addr addr;
+        addr.s_addr = INADDR_ANY;
+        if (setsockopt(sock, IPPROTO_IP, IP_MULTICAST_IF, (char*)&addr, sizeof(addr)) < 0) {
+            Log("Failed to set IP_MULTICAST_IF");
+            closesocket(sock);
+            WSACleanup();
+            CoUninitialize();
+            return 1;
+        }
+
+        // Join the multicast group on all interfaces
         ip_mreq mreq;
         mreq.imr_multiaddr.s_addr = inet_addr(REMOTE_IP);
         mreq.imr_interface.s_addr = INADDR_ANY;
@@ -189,101 +201,101 @@ int main(int argc, char* argv[]) {
             return 1;
         }
     }
+        Log("Multicast setup completed successfully");
+        while (true) {
+            IMMDeviceEnumerator* pEnumerator = NULL;
+            IMMDevice* pDevice = NULL;
+            IAudioClient* pAudioClient = NULL;
+            IAudioCaptureClient* pCaptureClient = NULL;
+            WAVEFORMATEX* pwfx = NULL;
 
-    while (true) {
-        IMMDeviceEnumerator* pEnumerator = NULL;
-        IMMDevice* pDevice = NULL;
-        IAudioClient* pAudioClient = NULL;
-        IAudioCaptureClient* pCaptureClient = NULL;
-        WAVEFORMATEX* pwfx = NULL;
+            hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&pEnumerator);
+            if (FAILED(hr)) {
+                LogError("Failed to create device enumerator", hr);
+                continue;
+            }
 
-        hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&pEnumerator);
-        if (FAILED(hr)) {
-            LogError("Failed to create device enumerator", hr);
-            continue;
-        }
+            hr = pEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &pDevice);
+            if (FAILED(hr)) {
+                LogError("Failed to get default audio endpoint", hr);
+                pEnumerator->Release();
+                continue;
+            }
 
-        hr = pEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &pDevice);
-        if (FAILED(hr)) {
-            LogError("Failed to get default audio endpoint", hr);
-            pEnumerator->Release();
-            continue;
-        }
+            hr = pDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, NULL, (void**)&pAudioClient);
+            if (FAILED(hr)) {
+                LogError("Failed to activate audio client", hr);
+                pDevice->Release();
+                pEnumerator->Release();
+                continue;
+            }
 
-        hr = pDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, NULL, (void**)&pAudioClient);
-        if (FAILED(hr)) {
-            LogError("Failed to activate audio client", hr);
-            pDevice->Release();
-            pEnumerator->Release();
-            continue;
-        }
+            hr = pAudioClient->GetMixFormat(&pwfx);
+            if (FAILED(hr)) {
+                LogError("Failed to get mix format", hr);
+                pAudioClient->Release();
+                pDevice->Release();
+                pEnumerator->Release();
+                continue;
+            }
 
-        hr = pAudioClient->GetMixFormat(&pwfx);
-        if (FAILED(hr)) {
-            LogError("Failed to get mix format", hr);
-            pAudioClient->Release();
-            pDevice->Release();
-            pEnumerator->Release();
-            continue;
-        }
+            pwfx->wFormatTag = WAVE_FORMAT_PCM;
+            pwfx->cbSize = 0;
 
-        pwfx->wFormatTag = WAVE_FORMAT_PCM;
-        pwfx->cbSize = 0;
+            hr = pAudioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, 0, 0, pwfx, NULL);
+            if (FAILED(hr)) {
+                LogError("Failed to initialize audio client", hr);
+                CoTaskMemFree(pwfx);
+                pAudioClient->Release();
+                pDevice->Release();
+                pEnumerator->Release();
+                continue;
+            }
 
-        hr = pAudioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, 0, 0, pwfx, NULL);
-        if (FAILED(hr)) {
-            LogError("Failed to initialize audio client", hr);
+            hr = pAudioClient->GetService(__uuidof(IAudioCaptureClient), (void**)&pCaptureClient);
+            if (FAILED(hr)) {
+                LogError("Failed to get audio capture client", hr);
+                CoTaskMemFree(pwfx);
+                pAudioClient->Release();
+                pDevice->Release();
+                pEnumerator->Release();
+                continue;
+            }
+
+            hr = pAudioClient->Start();
+            if (FAILED(hr)) {
+                LogError("Failed to start audio client", hr);
+                pCaptureClient->Release();
+                CoTaskMemFree(pwfx);
+                pAudioClient->Release();
+                pDevice->Release();
+                pEnumerator->Release();
+                continue;
+            }
+
+            Log("Starting audio capture");
+            hr = CaptureAudio(pAudioClient, pCaptureClient, reinterpret_cast<WAVEFORMATEXTENSIBLE*>(pwfx), sock, remoteAddr);
+            if (FAILED(hr)) {
+                LogError("Audio capture failed", hr);
+            }
+
+            Log("Cleaning up resources");
+            pAudioClient->Stop();
             CoTaskMemFree(pwfx);
-            pAudioClient->Release();
-            pDevice->Release();
-            pEnumerator->Release();
-            continue;
-        }
-
-        hr = pAudioClient->GetService(__uuidof(IAudioCaptureClient), (void**)&pCaptureClient);
-        if (FAILED(hr)) {
-            LogError("Failed to get audio capture client", hr);
-            CoTaskMemFree(pwfx);
-            pAudioClient->Release();
-            pDevice->Release();
-            pEnumerator->Release();
-            continue;
-        }
-
-        hr = pAudioClient->Start();
-        if (FAILED(hr)) {
-            LogError("Failed to start audio client", hr);
             pCaptureClient->Release();
-            CoTaskMemFree(pwfx);
             pAudioClient->Release();
             pDevice->Release();
             pEnumerator->Release();
-            continue;
+
+            Log("Restarting audio capture...");
         }
 
-        Log("Starting audio capture");
-        hr = CaptureAudio(pAudioClient, pCaptureClient, reinterpret_cast<WAVEFORMATEXTENSIBLE*>(pwfx), sock, remoteAddr);
-        if (FAILED(hr)) {
-            LogError("Audio capture failed", hr);
-        }
+        // This part will never be reached in the current implementation
+        closesocket(sock);
+        WSACleanup();
+        CoUninitialize();
 
-        Log("Cleaning up resources");
-        pAudioClient->Stop();
-        CoTaskMemFree(pwfx);
-        pCaptureClient->Release();
-        pAudioClient->Release();
-        pDevice->Release();
-        pEnumerator->Release();
+        Log("Application ended");
 
-        Log("Restarting audio capture...");
-    }
-
-    // This part will never be reached in the current implementation
-    closesocket(sock);
-    WSACleanup();
-    CoUninitialize();
-
-    Log("Application ended");
-
-    return 0;
-}
+        return 0;
+}    
