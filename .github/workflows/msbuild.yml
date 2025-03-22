@@ -45,7 +45,7 @@ jobs:
 
     - name: Get short SHA
       id: short-sha
-      run: echo "SHORT_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+      run: echo "SHORT_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
       shell: bash
 
     - name: Create artifacts directory
@@ -63,22 +63,22 @@ jobs:
       shell: cmd
 
     - name: Create ZIP archive
-      run: Compress-Archive -Path artifacts\* -DestinationPath ScreamSender-${{ env.SHORT_SHA }}.zip
+      run: Compress-Archive -Path artifacts\* -DestinationPath ScreamSender-${{ steps.short-sha.outputs.SHORT_SHA }}.zip
       shell: pwsh
 
     - name: Upload ScreamSender.exe artifact
-      uses: actions/upload-artifact@v2
+      uses: actions/upload-artifact@v4
       with:
         name: ScreamSender
-        path: D:\a\windows-scream-sender\windows-scream-sender\x64\Release\ScreamSender.exe
+        path: x64\Release\ScreamSender.exe
 
     - name: Create Release
       id: create_release
       uses: softprops/action-gh-release@v1
       if: github.event_name == 'push' && github.ref == 'refs/heads/main'
       with:
-        tag_name: ${{ env.SHORT_SHA }}
-        name: Release ${{ env.SHORT_SHA }}
-        files: ScreamSender-${{ env.SHORT_SHA }}.zip
+        tag_name: ${{ steps.short-sha.outputs.SHORT_SHA }}
+        name: Release ${{ steps.short-sha.outputs.SHORT_SHA }}
+        files: ScreamSender-${{ steps.short-sha.outputs.SHORT_SHA }}.zip
         draft: false
         prerelease: false
