@@ -13,12 +13,16 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <string>
+#include <Functiondiscoverykeys_devpkey.h>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "ole32.lib")
 
 #define BUFFER_SIZE 1152
 #define HEADER_SIZE 5
+
+// Device change event handle
+HANDLE g_deviceChangeEvent = NULL;
 
 void Log(const std::string& message) {
     printf("%s\n", message.c_str());
@@ -28,6 +32,111 @@ void LogError(const std::string& message, HRESULT hr) {
     printf("%i : %s\n", hr, message.c_str());
 }
 
+// Device notification callback class
+class CMMNotificationClient : public IMMNotificationClient {
+private:
+    LONG _cRef;
+    IMMDeviceEnumerator* _pEnumerator;
+
+public:
+    CMMNotificationClient() : _cRef(1), _pEnumerator(NULL) {
+    }
+
+    ~CMMNotificationClient() {
+        if (_pEnumerator) {
+            _pEnumerator->Release();
+        }
+    }
+
+    void SetEnumerator(IMMDeviceEnumerator* pEnumerator) {
+        _pEnumerator = pEnumerator;
+        _pEnumerator->AddRef();
+    }
+
+    // IUnknown methods
+    ULONG STDMETHODCALLTYPE AddRef() {
+        return InterlockedIncrement(&_cRef);
+    }
+
+    ULONG STDMETHODCALLTYPE Release() {
+        ULONG ulRef = InterlockedDecrement(&_cRef);
+        if (ulRef == 0) {
+            delete this;
+        }
+        return ulRef;
+    }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, VOID** ppvInterface) {
+        if (riid == IID_IUnknown) {
+            AddRef();
+            *ppvInterface = (IUnknown*)this;
+        }
+        else if (riid == __uuidof(IMMNotificationClient)) {
+            AddRef();
+            *ppvInterface = (IMMNotificationClient*)this;
+        }
+        else {
+            *ppvInterface = NULL;
+            return E_NOINTERFACE;
+        }
+        return S_OK;
+    }
+
+    // IMMNotificationClient methods
+    HRESULT STDMETHODCALLTYPE OnDeviceStateChanged(LPCWSTR pwstrDeviceId, DWORD dwNewState) {
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE OnDeviceAdded(LPCWSTR pwstrDeviceId) {
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE OnDeviceRemoved(LPCWSTR pwstrDeviceId) {
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE OnDefaultDeviceChanged(EDataFlow flow, ERole role, LPCWSTR pwstrDefaultDeviceId) {
+        if (flow == eRender && role == eConsole) {
+            Log("Default audio device changed");
+            SetEvent(g_deviceChangeEvent); // Signal that device has changed
+        }
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE OnPropertyValueChanged(LPCWSTR pwstrDeviceId, const PROPERTYKEY key) {
+        return S_OK;
+    }
+};
+
+// Function to get device friendly name
+std::string GetDeviceName(IMMDevice* pDevice) {
+    if (!pDevice) return "Unknown Device";
+
+    IPropertyStore* pProps = NULL;
+    PROPVARIANT varName;
+    PropVariantInit(&varName);
+    std::string deviceName = "Unknown Device";
+
+    HRESULT hr = pDevice->OpenPropertyStore(STGM_READ, &pProps);
+    if (SUCCEEDED(hr)) {
+        hr = pProps->GetValue(PKEY_Device_FriendlyName, &varName);
+        if (SUCCEEDED(hr) && varName.vt == VT_LPWSTR) {
+            // Convert wide string to narrow string
+            int size_needed = WideCharToMultiByte(CP_UTF8, 0, varName.pwszVal, -1, NULL, 0, NULL, NULL);
+            if (size_needed > 0) {
+                std::vector<char> buffer(size_needed);
+                WideCharToMultiByte(CP_UTF8, 0, varName.pwszVal, -1, &buffer[0], size_needed, NULL, NULL);
+                deviceName = &buffer[0];
+            }
+        }
+        PropVariantClear(&varName);
+        pProps->Release();
+    }
+
+    return deviceName;
+}
+
+// Modified to handle device disconnections
 HRESULT CaptureAudio(IAudioClient* pAudioClient, IAudioCaptureClient* pCaptureClient, WAVEFORMATEXTENSIBLE* pwfex, SOCKET sock, sockaddr_in remoteAddr) {
     UINT32 packetLength = 0;
     BYTE* pData;
@@ -39,11 +148,40 @@ HRESULT CaptureAudio(IAudioClient* pAudioClient, IAudioCaptureClient* pCaptureCl
 
     char pcmBuffer[BUFFER_SIZE * 8] = { 0 };
     uint32_t pcmBufferHead = 0;
+    
+    HANDLE events[2] = { g_deviceChangeEvent, NULL };
+    HANDLE waitEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+    if (waitEvent == NULL) {
+        LogError("Failed to create wait event", GetLastError());
+        return E_FAIL;
+    }
+    events[1] = waitEvent;
+
+    // Loop until told to stop or device changes
     while (true) {
+        // Wait for audio data (small timeout)
         Sleep(3);
+
+        // Check if device change event was signaled
+        DWORD waitResult = WaitForMultipleObjects(2, events, FALSE, 0);
+        if (waitResult == WAIT_OBJECT_0) {
+            // Default audio device has changed
+            Log("Audio device change detected, reconnecting...");
+            ResetEvent(g_deviceChangeEvent);
+            CloseHandle(waitEvent);
+            return S_FALSE; // Special return code to signal device change
+        }
+
         HRESULT hr = pCaptureClient->GetNextPacketSize(&packetLength);
         if (FAILED(hr)) {
+            // Check if this is a device disconnect error
+            if (hr == AUDCLNT_E_DEVICE_INVALIDATED || hr == E_INVALIDARG) {
+                LogError("Audio device disconnected", hr);
+                CloseHandle(waitEvent);
+                return S_FALSE; // Special return code to signal device change
+            }
             LogError("Failed to get next packet size", hr);
+            CloseHandle(waitEvent);
             return hr;
         }
 
@@ -51,7 +189,14 @@ HRESULT CaptureAudio(IAudioClient* pAudioClient, IAudioCaptureClient* pCaptureCl
             numFramesAvailable = 0;
             hr = pCaptureClient->GetBuffer(&pData, &numFramesAvailable, &flags, NULL, NULL);
             if (FAILED(hr)) {
+                // Check if this is a device disconnect error
+                if (hr == AUDCLNT_E_DEVICE_INVALIDATED || hr == E_INVALIDARG) {
+                    LogError("Audio device disconnected while getting buffer", hr);
+                    CloseHandle(waitEvent);
+                    return S_FALSE; // Special return code to signal device change
+                }
                 LogError("Failed to get buffer", hr);
+                CloseHandle(waitEvent);
                 return hr;
             }
 
@@ -87,17 +232,32 @@ HRESULT CaptureAudio(IAudioClient* pAudioClient, IAudioCaptureClient* pCaptureCl
             }
             hr = pCaptureClient->ReleaseBuffer(numFramesAvailable);
             if (FAILED(hr)) {
+                // Check if this is a device disconnect error
+                if (hr == AUDCLNT_E_DEVICE_INVALIDATED || hr == E_INVALIDARG) {
+                    LogError("Audio device disconnected while releasing buffer", hr);
+                    CloseHandle(waitEvent);
+                    return S_FALSE; // Special return code to signal device change
+                }
                 LogError("Failed to release buffer", hr);
+                CloseHandle(waitEvent);
                 return hr;
             }
             hr = pCaptureClient->GetNextPacketSize(&packetLength);
             if (FAILED(hr)) {
+                // Check if this is a device disconnect error
+                if (hr == AUDCLNT_E_DEVICE_INVALIDATED || hr == E_INVALIDARG) {
+                    LogError("Audio device disconnected while getting next packet size", hr);
+                    CloseHandle(waitEvent);
+                    return S_FALSE; // Special return code to signal device change
+                }
                 LogError("Failed to get next packet size", hr);
+                CloseHandle(waitEvent);
                 return hr;
             }
         }
     }
 
+    CloseHandle(waitEvent);
     return S_OK;
 }
 
@@ -213,31 +373,81 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
         Log("Multicast setup completed successfully");
     }
+
+    // Create device change event
+    g_deviceChangeEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (g_deviceChangeEvent == NULL) {
+        LogError("Failed to create device change event", GetLastError());
+        closesocket(sock);
+        WSACleanup();
+        CoUninitialize();
+        return 1;
+    }
+
+    // Create and set up the notification client
+    CMMNotificationClient* pNotificationClient = new CMMNotificationClient();
+    if (!pNotificationClient) {
+        Log("Failed to create notification client");
+        CloseHandle(g_deviceChangeEvent);
+        closesocket(sock);
+        WSACleanup();
+        CoUninitialize();
+        return 1;
+    }
+
+    IMMDeviceEnumerator* pEnumerator = NULL;
+
+    // Create device enumerator
+    hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&pEnumerator);
+    if (FAILED(hr)) {
+        LogError("Failed to create device enumerator", hr);
+        delete pNotificationClient;
+        CloseHandle(g_deviceChangeEvent);
+        closesocket(sock);
+        WSACleanup();
+        CoUninitialize();
+        return 1;
+    }
+
+    // Set enumerator for the notification client
+    pNotificationClient->SetEnumerator(pEnumerator);
+
+    // Register for notifications
+    hr = pEnumerator->RegisterEndpointNotificationCallback(pNotificationClient);
+    if (FAILED(hr)) {
+        LogError("Failed to register for endpoint notifications", hr);
+        pEnumerator->Release();
+        delete pNotificationClient;
+        CloseHandle(g_deviceChangeEvent);
+        closesocket(sock);
+        WSACleanup();
+        CoUninitialize();
+        return 1;
+    }
+
     while (true) {
-        IMMDeviceEnumerator* pEnumerator = NULL;
         IMMDevice* pDevice = NULL;
         IAudioClient* pAudioClient = NULL;
         IAudioCaptureClient* pCaptureClient = NULL;
         WAVEFORMATEX* pwfx = NULL;
 
-        hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&pEnumerator);
-        if (FAILED(hr)) {
-            LogError("Failed to create device enumerator", hr);
-            continue;
-        }
-
+        // Get the default audio endpoint
         hr = pEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &pDevice);
         if (FAILED(hr)) {
             LogError("Failed to get default audio endpoint", hr);
-            pEnumerator->Release();
+            Sleep(1000); // Wait before retrying
             continue;
         }
+
+        // Get device name for logging
+        std::string deviceName = GetDeviceName(pDevice);
+        Log("Using audio device: " + deviceName);
 
         hr = pDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, NULL, (void**)&pAudioClient);
         if (FAILED(hr)) {
             LogError("Failed to activate audio client", hr);
             pDevice->Release();
-            pEnumerator->Release();
+            Sleep(1000); // Wait before retrying
             continue;
         }
 
@@ -246,7 +456,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             LogError("Failed to get mix format", hr);
             pAudioClient->Release();
             pDevice->Release();
-            pEnumerator->Release();
+            Sleep(1000); // Wait before retrying
             continue;
         }
 
@@ -259,7 +469,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             CoTaskMemFree(pwfx);
             pAudioClient->Release();
             pDevice->Release();
-            pEnumerator->Release();
+            Sleep(1000); // Wait before retrying
             continue;
         }
 
@@ -269,7 +479,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             CoTaskMemFree(pwfx);
             pAudioClient->Release();
             pDevice->Release();
-            pEnumerator->Release();
+            Sleep(1000); // Wait before retrying
             continue;
         }
 
@@ -280,28 +490,41 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             CoTaskMemFree(pwfx);
             pAudioClient->Release();
             pDevice->Release();
-            pEnumerator->Release();
+            Sleep(1000); // Wait before retrying
             continue;
         }
 
         Log("Starting audio capture");
+        // The return value from CaptureAudio now has special meaning:
+        // S_OK = Normal exit, should not happen unless we add a way to exit gracefully
+        // S_FALSE = Device change detected, should reconnect
+        // Failed HRESULT = Error occurred, may need to delay before retrying
         hr = CaptureAudio(pAudioClient, pCaptureClient, reinterpret_cast<WAVEFORMATEXTENSIBLE*>(pwfx), sock, remoteAddr);
-        if (FAILED(hr)) {
-            LogError("Audio capture failed", hr);
-        }
-
+        
         Log("Cleaning up resources");
         pAudioClient->Stop();
         CoTaskMemFree(pwfx);
         pCaptureClient->Release();
         pAudioClient->Release();
         pDevice->Release();
-        pEnumerator->Release();
 
-        Log("Restarting audio capture...");
+        if (FAILED(hr)) {
+            LogError("Audio capture failed with error", hr);
+            Sleep(1000); // Wait before retrying on hard errors
+        } else if (hr == S_FALSE) {
+            Log("Audio device changed, reconnecting immediately");
+            // No delay, reconnect immediately for device changes
+        } else {
+            Log("Audio capture completed normally");
+            // This should not happen in current implementation
+        }
     }
 
     // This part will never be reached in the current implementation
+    pEnumerator->UnregisterEndpointNotificationCallback(pNotificationClient);
+    pEnumerator->Release();
+    delete pNotificationClient;
+    CloseHandle(g_deviceChangeEvent);
     closesocket(sock);
     WSACleanup();
     CoUninitialize();
@@ -310,4 +533,3 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     return 0;
 }
-
