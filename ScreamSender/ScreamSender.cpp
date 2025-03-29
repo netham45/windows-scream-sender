@@ -9,28 +9,69 @@
 #include <iomanip>
 #include <chrono>
 #include <string>
+#include <sstream>
 #include <ws2ipdef.h>
 #include <windows.h>
 #include <shellapi.h>
-#include <string>
 #include <Functiondiscoverykeys_devpkey.h>
+#include <ks.h>
+#include <ksmedia.h>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "ole32.lib")
 
-#define BUFFER_SIZE 1152
-#define HEADER_SIZE 5
+// Global variables
+static std::ofstream g_logFile;
+static bool g_logging = false;
 
-// Device change event handle
-HANDLE g_deviceChangeEvent = NULL;
+std::string GetTimestamp() {
+    auto now = std::chrono::system_clock::now();
+    auto time = std::chrono::system_clock::to_time_t(now);
+    struct tm timeinfo;
+    localtime_s(&timeinfo, &time);
+    std::ostringstream ss;
+    ss << std::put_time(&timeinfo, "%Y-%m-%d %H:%M:%S");
+    return ss.str();
+}
+
+void LogFormat(const std::string& format, const std::vector<std::string>& values) {
+    if (!g_logging) return;
+    std::ostringstream ss;
+    for (const auto& value : values) {
+        ss << "  " << value << "\n";
+    }
+    std::string logMessage = format + ":\n" + ss.str();
+    printf("%s", logMessage.c_str());
+    if (g_logFile.is_open()) {
+        g_logFile << logMessage;
+        g_logFile.flush();
+    }
+}
 
 void Log(const std::string& message) {
-    printf("%s\n", message.c_str());
+    if (!g_logging) return;
+    std::string timestamp = GetTimestamp();
+    std::string logMessage = timestamp + " | " + message;
+    printf("%s\n", logMessage.c_str());
+    if (g_logFile.is_open()) {
+        g_logFile << logMessage << std::endl;
+        g_logFile.flush();
+    }
 }
 
 void LogError(const std::string& message, HRESULT hr) {
-    printf("%i : %s\n", hr, message.c_str());
+    if (!g_logging) return;
+    std::string timestamp = GetTimestamp();
+    std::string logMessage = timestamp + " | ERROR " + std::to_string(hr) + " : " + message;
+    printf("%s\n", logMessage.c_str());
+    if (g_logFile.is_open()) {
+        g_logFile << logMessage << std::endl;
+        g_logFile.flush();
+    }
 }
+
+// Device change event handle
+HANDLE g_deviceChangeEvent = NULL;
 
 // Device notification callback class
 class CMMNotificationClient : public IMMNotificationClient {
@@ -136,8 +177,15 @@ std::string GetDeviceName(IMMDevice* pDevice) {
     return deviceName;
 }
 
+#define BUFFER_SIZE 1152
+#define HEADER_SIZE 5
+
 // Modified to handle device disconnections
 HRESULT CaptureAudio(IAudioClient* pAudioClient, IAudioCaptureClient* pCaptureClient, WAVEFORMATEXTENSIBLE* pwfex, SOCKET sock, sockaddr_in remoteAddr) {
+    if (!pCaptureClient) {
+        return E_POINTER;
+    }
+
     UINT32 packetLength = 0;
     BYTE* pData;
     UINT32 numFramesAvailable;
@@ -146,7 +194,7 @@ HRESULT CaptureAudio(IAudioClient* pAudioClient, IAudioCaptureClient* pCaptureCl
 
     Log("Starting audio capture loop");
 
-    char pcmBuffer[BUFFER_SIZE * 8] = { 0 };
+    char pcmBuffer[BUFFER_SIZE * 512] = { 0 };
     uint32_t pcmBufferHead = 0;
     
     HANDLE events[2] = { g_deviceChangeEvent, NULL };
@@ -157,10 +205,9 @@ HRESULT CaptureAudio(IAudioClient* pAudioClient, IAudioCaptureClient* pCaptureCl
     }
     events[1] = waitEvent;
 
-    // Loop until told to stop or device changes
     while (true) {
         // Wait for audio data (small timeout)
-        Sleep(3);
+        Sleep(1);
 
         // Check if device change event was signaled
         DWORD waitResult = WaitForMultipleObjects(2, events, FALSE, 0);
@@ -189,23 +236,28 @@ HRESULT CaptureAudio(IAudioClient* pAudioClient, IAudioCaptureClient* pCaptureCl
             numFramesAvailable = 0;
             hr = pCaptureClient->GetBuffer(&pData, &numFramesAvailable, &flags, NULL, NULL);
             if (FAILED(hr)) {
-                // Check if this is a device disconnect error
-                if (hr == AUDCLNT_E_DEVICE_INVALIDATED || hr == E_INVALIDARG) {
-                    LogError("Audio device disconnected while getting buffer", hr);
-                    CloseHandle(waitEvent);
-                    return S_FALSE; // Special return code to signal device change
-                }
                 LogError("Failed to get buffer", hr);
                 CloseHandle(waitEvent);
                 return hr;
             }
-
             if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
                 pData = NULL;
                 Log("Silent buffer detected");
             }
             if (pData) {
                 UINT32 bytesToCopy = numFramesAvailable * pwfex->Format.nBlockAlign;
+                
+                // Check if we have enough space
+                if (pcmBufferHead + bytesToCopy > sizeof(pcmBuffer)) {
+                    LogError("Buffer overflow prevented", E_BOUNDS);
+                    hr = pCaptureClient->ReleaseBuffer(numFramesAvailable);
+                    if (FAILED(hr)) {
+                        LogError("Failed to release buffer", hr);
+                        CloseHandle(waitEvent);
+                        return hr;
+                    }
+                    continue;
+                }
 
                 memcpy(pcmBuffer + pcmBufferHead, pData, bytesToCopy);
                 pcmBufferHead += bytesToCopy;
@@ -213,9 +265,9 @@ HRESULT CaptureAudio(IAudioClient* pAudioClient, IAudioCaptureClient* pCaptureCl
                     bool is_44100 = pwfex->Format.nSamplesPerSec % 44100 == 0;
                     int sample_mask = pwfex->Format.nSamplesPerSec / (is_44100 ? 44100 : 48000);
                     sample_mask |= is_44100 << 7;
-                    buffer[0] = sample_mask;
-                    buffer[1] = pwfex->Format.wBitsPerSample;
-                    buffer[2] = pwfex->Format.nChannels;
+                    buffer[0] = static_cast<char>(sample_mask);
+                    buffer[1] = static_cast<char>(pwfex->Format.wBitsPerSample);
+                    buffer[2] = static_cast<char>(pwfex->Format.nChannels);
                     buffer[3] = static_cast<BYTE>((pwfex->dwChannelMask >> 8) & 0xFF);
                     buffer[4] = static_cast<BYTE>(pwfex->dwChannelMask & 0xFF);
 
@@ -225,31 +277,19 @@ HRESULT CaptureAudio(IAudioClient* pAudioClient, IAudioCaptureClient* pCaptureCl
                         Log("Failed to send data over UDP");
                     }
 
-                    for (int i = 0; i < pcmBufferHead - BUFFER_SIZE; i++)
+                    for (size_t i = 0; i < pcmBufferHead - BUFFER_SIZE; i++)
                         pcmBuffer[i] = pcmBuffer[i + BUFFER_SIZE];
                     pcmBufferHead -= BUFFER_SIZE;
                 }
             }
             hr = pCaptureClient->ReleaseBuffer(numFramesAvailable);
             if (FAILED(hr)) {
-                // Check if this is a device disconnect error
-                if (hr == AUDCLNT_E_DEVICE_INVALIDATED || hr == E_INVALIDARG) {
-                    LogError("Audio device disconnected while releasing buffer", hr);
-                    CloseHandle(waitEvent);
-                    return S_FALSE; // Special return code to signal device change
-                }
                 LogError("Failed to release buffer", hr);
                 CloseHandle(waitEvent);
                 return hr;
             }
             hr = pCaptureClient->GetNextPacketSize(&packetLength);
             if (FAILED(hr)) {
-                // Check if this is a device disconnect error
-                if (hr == AUDCLNT_E_DEVICE_INVALIDATED || hr == E_INVALIDARG) {
-                    LogError("Audio device disconnected while getting next packet size", hr);
-                    CloseHandle(waitEvent);
-                    return S_FALSE; // Special return code to signal device change
-                }
                 LogError("Failed to get next packet size", hr);
                 CloseHandle(waitEvent);
                 return hr;
@@ -261,38 +301,65 @@ HRESULT CaptureAudio(IAudioClient* pAudioClient, IAudioCaptureClient* pCaptureCl
     return S_OK;
 }
 
-
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
-    Log("Application started");
+    printf("Application starting...\n"); // Keep this one as printf since Log isn't initialized yet
 
     int argc;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (argc < 2) {
-        Log("Usage: program.exe <IP> [port] [-m]");
-        Log(" Default port 16401");
-        Log(" -m Enable Multicast");
+    printf("Usage: program.exe <IP> [port] [-m] [-l]\n"); // Keep as printf since Log isn't initialized
+    printf(" Default port 16401\n");
+    printf(" -m Enable Multicast\n");
+    printf(" -l Enable Logging\n");
         LocalFree(argv);
         return 1;
     }
 
     std::wstring wRemoteIP(argv[1]);
-    std::string REMOTE_IP(wRemoteIP.begin(), wRemoteIP.end());
+    std::string REMOTE_IP;
+    REMOTE_IP.reserve(wRemoteIP.length());
+    for (wchar_t wc : wRemoteIP) {
+        REMOTE_IP.push_back(static_cast<char>(wc & 0xFF));
+    }
     int REMOTE_PORT = 16401;
     bool multicast = false;
-
     for (int i = 2; i < argc; i++) {
         if (wcscmp(argv[i], L"-m") == 0) {
             multicast = true;
-        } else {
+        }
+        else if (wcscmp(argv[i], L"-l") == 0) {
+            g_logging = true;
+        }
+        else {
             try {
                 REMOTE_PORT = std::stoi(std::wstring(argv[i]));
-            } catch (const std::exception&) {
-                Log("Invalid port number. Using default port 16401.");
+            }
+            catch (const std::exception&) {
+                printf("Invalid port number. Using default port 16401.\n");
             }
         }
     }
 
     LocalFree(argv);
+
+    // Only open log file if logging is enabled
+    if (g_logging) {
+        auto now = std::chrono::system_clock::now();
+        auto time = std::chrono::system_clock::to_time_t(now);
+        struct tm timeinfo;
+        localtime_s(&timeinfo, &time);
+        std::ostringstream ss;
+        ss << "scream_sender_" << REMOTE_IP << "_" << REMOTE_PORT << "_" 
+           << std::put_time(&timeinfo, "%Y%m%d_%H%M%S") << ".log";
+        g_logFile.open(ss.str(), std::ios::out | std::ios::app);
+        if (!g_logFile.is_open()) {
+            printf("Failed to open log file\n");
+            return 1;
+        }
+
+        Log("Application started");
+        Log("Connecting to " + REMOTE_IP + ":" + std::to_string(REMOTE_PORT) + (multicast ? " (multicast)" : ""));
+    }
 
     // Set the highest process priority possible
     if (!SetPriorityClass(GetCurrentProcess(), REALTIME_PRIORITY_CLASS)) {
@@ -439,10 +506,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             continue;
         }
 
-        // Get device name for logging
-        std::string deviceName = GetDeviceName(pDevice);
-        Log("Using audio device: " + deviceName);
-
         hr = pDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, NULL, (void**)&pAudioClient);
         if (FAILED(hr)) {
             LogError("Failed to activate audio client", hr);
@@ -460,28 +523,93 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             continue;
         }
 
-        pwfx->wFormatTag = WAVE_FORMAT_PCM;
-        pwfx->cbSize = 0;
+        // Create a WAVEFORMATEXTENSIBLE format for multichannel PCM
+        WAVEFORMATEX *pwfxClosest = NULL;
+        WAVEFORMATEXTENSIBLE wfxExt = {0};
+        
+        // Copy the original format exactly
+        memcpy(&wfxExt, pwfx, sizeof(WAVEFORMATEXTENSIBLE));
+        
+        // Just change the SubFormat to PCM
+        wfxExt.SubFormat = KSDATAFORMAT_SUBTYPE_PCM;
 
-        hr = pAudioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, 0, 0, pwfx, NULL);
+        // Log original mix format
+        LogFormat("Original Mix Format", {
+            "wFormatTag: " + std::to_string(pwfx->wFormatTag),
+            "nChannels: " + std::to_string(pwfx->nChannels),
+            "nSamplesPerSec: " + std::to_string(pwfx->nSamplesPerSec),
+            "nAvgBytesPerSec: " + std::to_string(pwfx->nAvgBytesPerSec),
+            "nBlockAlign: " + std::to_string(pwfx->nBlockAlign),
+            "wBitsPerSample: " + std::to_string(pwfx->wBitsPerSample),
+            "cbSize: " + std::to_string(pwfx->cbSize)
+        });
+
+        // Log requested format
+        LogFormat("Requested Format", {
+            "wFormatTag: " + std::to_string(wfxExt.Format.wFormatTag),
+            "nChannels: " + std::to_string(wfxExt.Format.nChannels),
+            "nSamplesPerSec: " + std::to_string(wfxExt.Format.nSamplesPerSec),
+            "nAvgBytesPerSec: " + std::to_string(wfxExt.Format.nAvgBytesPerSec),
+            "nBlockAlign: " + std::to_string(wfxExt.Format.nBlockAlign),
+            "wBitsPerSample: " + std::to_string(wfxExt.Format.wBitsPerSample),
+            "cbSize: " + std::to_string(wfxExt.Format.cbSize)
+        });
+
+        // Check if the format is supported
+        hr = pAudioClient->IsFormatSupported(AUDCLNT_SHAREMODE_SHARED, reinterpret_cast<WAVEFORMATEX*>(&wfxExt), &pwfxClosest);
+        if (hr == S_FALSE && pwfxClosest) {
+            LogFormat("Using closest supported format", {
+                "wFormatTag: " + std::to_string(pwfxClosest->wFormatTag),
+                "nChannels: " + std::to_string(pwfxClosest->nChannels),
+                "nSamplesPerSec: " + std::to_string(pwfxClosest->nSamplesPerSec),
+                "nAvgBytesPerSec: " + std::to_string(pwfxClosest->nAvgBytesPerSec),
+                "nBlockAlign: " + std::to_string(pwfxClosest->nBlockAlign),
+                "wBitsPerSample: " + std::to_string(pwfxClosest->wBitsPerSample),
+                "cbSize: " + std::to_string(pwfxClosest->cbSize)
+            });
+
+            // Use the closest supported format
+            memcpy(&wfxExt, pwfxClosest, sizeof(WAVEFORMATEX) + pwfxClosest->cbSize);
+            CoTaskMemFree(pwfxClosest);
+        } else if (FAILED(hr)) {
+            LogError("Format not supported", hr);
+            CoTaskMemFree(pwfx);
+            pAudioClient->Release();
+            pDevice->Release();
+            continue;
+        }
+
+        // Initialize with the format
+        hr = pAudioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, 0, 0, reinterpret_cast<WAVEFORMATEX*>(&wfxExt), NULL);
         if (FAILED(hr)) {
             LogError("Failed to initialize audio client", hr);
             CoTaskMemFree(pwfx);
             pAudioClient->Release();
             pDevice->Release();
-            Sleep(1000); // Wait before retrying
             continue;
         }
 
+        Log("Attempting to get capture service");
         hr = pAudioClient->GetService(__uuidof(IAudioCaptureClient), (void**)&pCaptureClient);
         if (FAILED(hr)) {
             LogError("Failed to get audio capture client", hr);
             CoTaskMemFree(pwfx);
             pAudioClient->Release();
             pDevice->Release();
-            Sleep(1000); // Wait before retrying
             continue;
         }
+        Log("Successfully got capture service");
+        if (!pCaptureClient) {
+            LogError("pCaptureClient is null after successful GetService", hr);
+            CoTaskMemFree(pwfx);
+            pAudioClient->Release();
+            pDevice->Release();
+            continue;
+        }
+
+        // Get device name for logging
+        std::string deviceName = GetDeviceName(pDevice);
+        Log("Using audio device: " + deviceName);
 
         hr = pAudioClient->Start();
         if (FAILED(hr)) {
@@ -490,17 +618,24 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             CoTaskMemFree(pwfx);
             pAudioClient->Release();
             pDevice->Release();
-            Sleep(1000); // Wait before retrying
             continue;
         }
 
         Log("Starting audio capture");
-        // The return value from CaptureAudio now has special meaning:
-        // S_OK = Normal exit, should not happen unless we add a way to exit gracefully
-        // S_FALSE = Device change detected, should reconnect
-        // Failed HRESULT = Error occurred, may need to delay before retrying
-        hr = CaptureAudio(pAudioClient, pCaptureClient, reinterpret_cast<WAVEFORMATEXTENSIBLE*>(pwfx), sock, remoteAddr);
-        
+        hr = CaptureAudio(pAudioClient, pCaptureClient, &wfxExt, sock, remoteAddr);
+        if (FAILED(hr)) {
+            LogError("Audio capture failed", hr);
+            Sleep(1000); // Wait before retrying on hard errors
+        }
+        else if (hr == S_FALSE) {
+            Log("Audio device changed, reconnecting immediately");
+            // No delay, reconnect immediately for device changes
+        }
+        else {
+            Log("Audio capture completed normally");
+            // This should not happen in current implementation
+        }
+
         Log("Cleaning up resources");
         pAudioClient->Stop();
         CoTaskMemFree(pwfx);
@@ -508,16 +643,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         pAudioClient->Release();
         pDevice->Release();
 
-        if (FAILED(hr)) {
-            LogError("Audio capture failed with error", hr);
-            Sleep(1000); // Wait before retrying on hard errors
-        } else if (hr == S_FALSE) {
-            Log("Audio device changed, reconnecting immediately");
-            // No delay, reconnect immediately for device changes
-        } else {
-            Log("Audio capture completed normally");
-            // This should not happen in current implementation
-        }
+        Log("Restarting audio capture...");
     }
 
     // This part will never be reached in the current implementation
@@ -530,6 +656,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     CoUninitialize();
 
     Log("Application ended");
+
+    // Close log file
+    if (g_logFile.is_open()) {
+        g_logFile.close();
+    }
 
     return 0;
 }
