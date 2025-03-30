@@ -206,8 +206,6 @@ HRESULT CaptureAudio(IAudioClient* pAudioClient, IAudioCaptureClient* pCaptureCl
     events[1] = waitEvent;
 
     while (true) {
-        // Wait for audio data (small timeout)
-        Sleep(1);
 
         // Check if device change event was signaled
         DWORD waitResult = WaitForMultipleObjects(2, events, FALSE, 0);
@@ -377,6 +375,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     }
     else {
         Log("Thread priority set to THREAD_PRIORITY_TIME_CRITICAL");
+    }
+
+    // Pin to first CPU core to prevent core hopping
+    DWORD_PTR processAffinityMask = 1; // Use first core only
+    if (!SetProcessAffinityMask(GetCurrentProcess(), processAffinityMask)) {
+        DWORD error = GetLastError();
+        LogError("Failed to set process affinity", error);
+    }
+    else {
+        Log("Process pinned to CPU core 0");
     }
 
     HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
